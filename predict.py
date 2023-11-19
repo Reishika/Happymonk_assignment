@@ -1,340 +1,159 @@
-# Ultralytics YOLO 🚀, GPL-3.0 license
-
-import hydra
-import torch
-import argparse
-import time
+import cog
+import tempfile
 from pathlib import Path
-import math
+import argparse
+import shutil
+import os
 import cv2
+import glob
 import torch
-import torch.backends.cudnn as cudnn
-from numpy import random
-from ultralytics.yolo.engine.predictor import BasePredictor
-from ultralytics.yolo.utils import DEFAULT_CONFIG, ROOT, ops
-from ultralytics.yolo.utils.checks import check_imgsz
-from ultralytics.yolo.utils.plotting import Annotator, colors, save_one_box
-
-import cv2
-from deep_sort_pytorch.utils.parser import get_config
-from deep_sort_pytorch.deep_sort import DeepSort
-from collections import deque
+from collections import OrderedDict
 import numpy as np
-palette = (2 ** 11 - 1, 2 ** 15 - 1, 2 ** 20 - 1)
-data_deque = {}
-
-deepsort = None
-
-object_counter = {}
-
-object_counter1 = {}
-
-line = [(100, 500), (1050, 500)]
-speed_line_queue = {}
-def estimatespeed(Location1, Location2):
-    #Euclidean Distance Formula
-    d_pixel = math.sqrt(math.pow(Location2[0] - Location1[0], 2) + math.pow(Location2[1] - Location1[1], 2))
-    # defining thr pixels per meter
-    ppm = 8
-    d_meters = d_pixel/ppm
-    time_constant = 15*3.6
-    #distance = speed/time
-    speed = d_meters * time_constant
-
-    return int(speed)
-def init_tracker():
-    global deepsort
-    cfg_deep = get_config()
-    cfg_deep.merge_from_file("deep_sort_pytorch/configs/deep_sort.yaml")
-
-    deepsort= DeepSort(cfg_deep.DEEPSORT.REID_CKPT,
-                            max_dist=cfg_deep.DEEPSORT.MAX_DIST, min_confidence=cfg_deep.DEEPSORT.MIN_CONFIDENCE,
-                            nms_max_overlap=cfg_deep.DEEPSORT.NMS_MAX_OVERLAP, max_iou_distance=cfg_deep.DEEPSORT.MAX_IOU_DISTANCE,
-                            max_age=cfg_deep.DEEPSORT.MAX_AGE, n_init=cfg_deep.DEEPSORT.N_INIT, nn_budget=cfg_deep.DEEPSORT.NN_BUDGET,
-                            use_cuda=True)
-##########################################################################################
-def xyxy_to_xywh(*xyxy):
-    """" Calculates the relative bounding box from absolute pixel values. """
-    bbox_left = min([xyxy[0].item(), xyxy[2].item()])
-    bbox_top = min([xyxy[1].item(), xyxy[3].item()])
-    bbox_w = abs(xyxy[0].item() - xyxy[2].item())
-    bbox_h = abs(xyxy[1].item() - xyxy[3].item())
-    x_c = (bbox_left + bbox_w / 2)
-    y_c = (bbox_top + bbox_h / 2)
-    w = bbox_w
-    h = bbox_h
-    return x_c, y_c, w, h
-
-def xyxy_to_tlwh(bbox_xyxy):
-    tlwh_bboxs = []
-    for i, box in enumerate(bbox_xyxy):
-        x1, y1, x2, y2 = [int(i) for i in box]
-        top = x1
-        left = y1
-        w = int(x2 - x1)
-        h = int(y2 - y1)
-        tlwh_obj = [top, left, w, h]
-        tlwh_bboxs.append(tlwh_obj)
-    return tlwh_bboxs
-
-def compute_color_for_labels(label):
-    """
-    Simple function that adds fixed color depending on the class
-    """
-    if label == 0: #person
-        color = (85,45,255)
-    elif label == 2: # Car
-        color = (222,82,175)
-    elif label == 3:  # Motobike
-        color = (0, 204, 255)
-    elif label == 5:  # Bus
-        color = (0, 149, 255)
-    else:
-        color = [int((p * (label ** 2 - label + 1)) % 255) for p in palette]
-    return tuple(color)
-
-def draw_border(img, pt1, pt2, color, thickness, r, d):
-    x1,y1 = pt1
-    x2,y2 = pt2
-    # Top left
-    cv2.line(img, (x1 + r, y1), (x1 + r + d, y1), color, thickness)
-    cv2.line(img, (x1, y1 + r), (x1, y1 + r + d), color, thickness)
-    cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90, color, thickness)
-    # Top right
-    cv2.line(img, (x2 - r, y1), (x2 - r - d, y1), color, thickness)
-    cv2.line(img, (x2, y1 + r), (x2, y1 + r + d), color, thickness)
-    cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90, color, thickness)
-    # Bottom left
-    cv2.line(img, (x1 + r, y2), (x1 + r + d, y2), color, thickness)
-    cv2.line(img, (x1, y2 - r), (x1, y2 - r - d), color, thickness)
-    cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 90, 0, 90, color, thickness)
-    # Bottom right
-    cv2.line(img, (x2 - r, y2), (x2 - r - d, y2), color, thickness)
-    cv2.line(img, (x2, y2 - r), (x2, y2 - r - d), color, thickness)
-    cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0, 0, 90, color, thickness)
-
-    cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, -1, cv2.LINE_AA)
-    cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r - d), color, -1, cv2.LINE_AA)
-    
-    cv2.circle(img, (x1 +r, y1+r), 2, color, 12)
-    cv2.circle(img, (x2 -r, y1+r), 2, color, 12)
-    cv2.circle(img, (x1 +r, y2-r), 2, color, 12)
-    cv2.circle(img, (x2 -r, y2-r), 2, color, 12)
-    
-    return img
-
-def UI_box(x, img, color=None, label=None, line_thickness=None):
-    # Plots one bounding box on image img
-    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
-    color = color or [random.randint(0, 255) for _ in range(3)]
-    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
-    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
-    if label:
-        tf = max(tl - 1, 1)  # font thickness
-        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-
-        img = draw_border(img, (c1[0], c1[1] - t_size[1] -3), (c1[0] + t_size[0], c1[1]+3), color, 1, 8, 2)
-
-        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+from main_test_swinir import define_model, setup, get_image_pair
 
 
-def intersect(A,B,C,D):
-    return ccw(A,C,D) != ccw(B,C,D) and ccw(A,B,C) != ccw(A,B,D)
+class Predictor(cog.Predictor):
+    def setup(self):
+        model_dir = 'experiments/pretrained_models'
 
-def ccw(A,B,C):
-    return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+        self.model_zoo = {
+            'real_sr': {
+                4: os.path.join(model_dir, '003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth')
+            },
+            'gray_dn': {
+                15: os.path.join(model_dir, '004_grayDN_DFWB_s128w8_SwinIR-M_noise15.pth'),
+                25: os.path.join(model_dir, '004_grayDN_DFWB_s128w8_SwinIR-M_noise25.pth'),
+                50: os.path.join(model_dir, '004_grayDN_DFWB_s128w8_SwinIR-M_noise50.pth')
+            },
+            'color_dn': {
+                15: os.path.join(model_dir, '005_colorDN_DFWB_s128w8_SwinIR-M_noise15.pth'),
+                25: os.path.join(model_dir, '005_colorDN_DFWB_s128w8_SwinIR-M_noise25.pth'),
+                50: os.path.join(model_dir, '005_colorDN_DFWB_s128w8_SwinIR-M_noise50.pth')
+            },
+            'jpeg_car': {
+                10: os.path.join(model_dir, '006_CAR_DFWB_s126w7_SwinIR-M_jpeg10.pth'),
+                20: os.path.join(model_dir, '006_CAR_DFWB_s126w7_SwinIR-M_jpeg20.pth'),
+                30: os.path.join(model_dir, '006_CAR_DFWB_s126w7_SwinIR-M_jpeg30.pth'),
+                40: os.path.join(model_dir, '006_CAR_DFWB_s126w7_SwinIR-M_jpeg40.pth')
+            }
+        }
 
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--task', type=str, default='real_sr', help='classical_sr, lightweight_sr, real_sr, '
+                                                                        'gray_dn, color_dn, jpeg_car')
+        parser.add_argument('--scale', type=int, default=1, help='scale factor: 1, 2, 3, 4, 8')  # 1 for dn and jpeg car
+        parser.add_argument('--noise', type=int, default=15, help='noise level: 15, 25, 50')
+        parser.add_argument('--jpeg', type=int, default=40, help='scale factor: 10, 20, 30, 40')
+        parser.add_argument('--training_patch_size', type=int, default=128, help='patch size used in training SwinIR. '
+                                                                                 'Just used to differentiate two different settings in Table 2 of the paper. '
+                                                                                 'Images are NOT tested patch by patch.')
+        parser.add_argument('--large_model', action='store_true',
+                            help='use large model, only provided for real image sr')
+        parser.add_argument('--model_path', type=str,
+                            default=self.model_zoo['real_sr'][4])
+        parser.add_argument('--folder_lq', type=str, default=None, help='input low-quality test image folder')
+        parser.add_argument('--folder_gt', type=str, default=None, help='input ground-truth test image folder')
 
-def get_direction(point1, point2):
-    direction_str = ""
+        self.args = parser.parse_args('')
 
-    # calculate y axis direction
-    if point1[1] > point2[1]:
-        direction_str += "South"
-    elif point1[1] < point2[1]:
-        direction_str += "North"
-    else:
-        direction_str += ""
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # calculate x axis direction
-    if point1[0] > point2[0]:
-        direction_str += "East"
-    elif point1[0] < point2[0]:
-        direction_str += "West"
-    else:
-        direction_str += ""
+        self.tasks = {
+            'Real-World Image Super-Resolution': 'real_sr',
+            'Grayscale Image Denoising': 'gray_dn',
+            'Color Image Denoising': 'color_dn',
+            'JPEG Compression Artifact Reduction': 'jpeg_car'
+        }
 
-    return direction_str
-def draw_boxes(img, bbox, names,object_id, identities=None, offset=(0, 0)):
-    cv2.line(img, line[0], line[1], (46,162,112), 3)
+    @cog.input("image", type=Path, help="input image")
+    @cog.input("task_type", type=str, default='Real-World Image Super-Resolution',
+               options=['Real-World Image Super-Resolution', 'Grayscale Image Denoising', 'Color Image Denoising',
+                        'JPEG Compression Artifact Reduction'],
+               help="image restoration task type")
+    @cog.input("noise", type=int, default=15, options=[15, 25, 50],
+               help='noise level, activated for Grayscale Image Denoising and Color Image Denoising. '
+                    'Leave it as default or arbitrary if other tasks are selected')
+    @cog.input("jpeg", type=int, default=40, options=[10, 20, 30, 40],
+               help='scale factor, activated for JPEG Compression Artifact Reduction. '
+                    'Leave it as default or arbitrary if other tasks are selected')
+    def predict(self, image, task_type='Real-World Image Super-Resolution', jpeg=40, noise=15):
 
-    height, width, _ = img.shape
-    # remove tracked point from buffer if object is lost
-    for key in list(data_deque):
-      if key not in identities:
-        data_deque.pop(key)
+        self.args.task = self.tasks[task_type]
+        self.args.noise = noise
+        self.args.jpeg = jpeg
 
-    for i, box in enumerate(bbox):
-        x1, y1, x2, y2 = [int(i) for i in box]
-        x1 += offset[0]
-        x2 += offset[0]
-        y1 += offset[1]
-        y2 += offset[1]
-
-        # code to find center of bottom edge
-        center = (int((x2+x1)/ 2), int((y2+y2)/2))
-
-        # get ID of object
-        id = int(identities[i]) if identities is not None else 0
-
-        # create new buffer for new object
-        if id not in data_deque:  
-          data_deque[id] = deque(maxlen= 64)
-          speed_line_queue[id] = []
-        color = compute_color_for_labels(object_id[i])
-        obj_name = names[object_id[i]]
-        label = '{}{:d}'.format("", id) + ":"+ '%s' % (obj_name)
-
-        # add center to buffer
-        data_deque[id].appendleft(center)
-        if len(data_deque[id]) >= 2:
-          direction = get_direction(data_deque[id][0], data_deque[id][1])
-          object_speed = estimatespeed(data_deque[id][1], data_deque[id][0])
-          speed_line_queue[id].append(object_speed)
-          if intersect(data_deque[id][0], data_deque[id][1], line[0], line[1]):
-              cv2.line(img, line[0], line[1], (255, 255, 255), 3)
-              if "South" in direction:
-                if obj_name not in object_counter:
-                    object_counter[obj_name] = 1
-                else:
-                    object_counter[obj_name] += 1
-              if "North" in direction:
-                if obj_name not in object_counter1:
-                    object_counter1[obj_name] = 1
-                else:
-                    object_counter1[obj_name] += 1
+        # set model path
+        if self.args.task == 'real_sr':
+            self.args.scale = 4
+            self.args.model_path = self.model_zoo[self.args.task][4]
+        elif self.args.task in ['gray_dn', 'color_dn']:
+            self.args.model_path = self.model_zoo[self.args.task][noise]
+        else:
+            self.args.model_path = self.model_zoo[self.args.task][jpeg]
 
         try:
-            label = label + " " + str(sum(speed_line_queue[id])//len(speed_line_queue[id])) + "km/h"
-        except:
-            pass
-        UI_box(box, img, label=label, color=color, line_thickness=2)
-        # draw trail
-        for i in range(1, len(data_deque[id])):
-            # check if on buffer value is none
-            if data_deque[id][i - 1] is None or data_deque[id][i] is None:
-                continue
-            # generate dynamic thickness of trails
-            thickness = int(np.sqrt(64 / float(i + i)) * 1.5)
-            # draw trails
-            cv2.line(img, data_deque[id][i - 1], data_deque[id][i], color, thickness)
-    
-    #4. Display Count in top right corner
-        for idx, (key, value) in enumerate(object_counter1.items()):
-            cnt_str = str(key) + ":" +str(value)
-            cv2.line(img, (width - 500,25), (width,25), [85,45,255], 40)
-            cv2.putText(img, f'Number of Vehicles Entering', (width - 500, 35), 0, 1, [225, 255, 255], thickness=2, lineType=cv2.LINE_AA)
-            cv2.line(img, (width - 150, 65 + (idx*40)), (width, 65 + (idx*40)), [85, 45, 255], 30)
-            cv2.putText(img, cnt_str, (width - 150, 75 + (idx*40)), 0, 1, [255, 255, 255], thickness = 2, lineType = cv2.LINE_AA)
+            # set input folder
+            input_dir = 'input_cog_temp'
+            os.makedirs(input_dir, exist_ok=True)
+            input_path = os.path.join(input_dir, os.path.basename(image))
+            shutil.copy(str(image), input_path)
+            if self.args.task == 'real_sr':
+                self.args.folder_lq = input_dir
+            else:
+                self.args.folder_gt = input_dir
 
-        for idx, (key, value) in enumerate(object_counter.items()):
-            cnt_str1 = str(key) + ":" +str(value)
-            cv2.line(img, (20,25), (500,25), [85,45,255], 40)
-            cv2.putText(img, f'Numbers of Vehicles Leaving', (11, 35), 0, 1, [225, 255, 255], thickness=2, lineType=cv2.LINE_AA)    
-            cv2.line(img, (20,65+ (idx*40)), (127,65+ (idx*40)), [85,45,255], 30)
-            cv2.putText(img, cnt_str1, (11, 75+ (idx*40)), 0, 1, [225, 255, 255], thickness=2, lineType=cv2.LINE_AA)
-    
-    
-    
-    return img
+            model = define_model(self.args)
+            model.eval()
+            model = model.to(self.device)
 
+            # setup folder and path
+            folder, save_dir, border, window_size = setup(self.args)
+            os.makedirs(save_dir, exist_ok=True)
+            test_results = OrderedDict()
+            test_results['psnr'] = []
+            test_results['ssim'] = []
+            test_results['psnr_y'] = []
+            test_results['ssim_y'] = []
+            test_results['psnr_b'] = []
+            # psnr, ssim, psnr_y, ssim_y, psnr_b = 0, 0, 0, 0, 0
+            out_path = Path(tempfile.mkdtemp()) / "out.png"
 
-class DetectionPredictor(BasePredictor):
+            for idx, path in enumerate(sorted(glob.glob(os.path.join(folder, '*')))):
+                # read image
+                imgname, img_lq, img_gt = get_image_pair(self.args, path)  # image to HWC-BGR, float32
+                img_lq = np.transpose(img_lq if img_lq.shape[2] == 1 else img_lq[:, :, [2, 1, 0]],
+                                      (2, 0, 1))  # HCW-BGR to CHW-RGB
+                img_lq = torch.from_numpy(img_lq).float().unsqueeze(0).to(self.device)  # CHW-RGB to NCHW-RGB
 
-    def get_annotator(self, img):
-        return Annotator(img, line_width=self.args.line_thickness, example=str(self.model.names))
+                # inference
+                with torch.no_grad():
+                    # pad input image to be a multiple of window_size
+                    _, _, h_old, w_old = img_lq.size()
+                    h_pad = (h_old // window_size + 1) * window_size - h_old
+                    w_pad = (w_old // window_size + 1) * window_size - w_old
+                    img_lq = torch.cat([img_lq, torch.flip(img_lq, [2])], 2)[:, :, :h_old + h_pad, :]
+                    img_lq = torch.cat([img_lq, torch.flip(img_lq, [3])], 3)[:, :, :, :w_old + w_pad]
+                    output = model(img_lq)
+                    output = output[..., :h_old * self.args.scale, :w_old * self.args.scale]
 
-    def preprocess(self, img):
-        img = torch.from_numpy(img).to(self.model.device)
-        img = img.half() if self.model.fp16 else img.float()  # uint8 to fp16/32
-        img /= 255  # 0 - 255 to 0.0 - 1.0
-        return img
-
-    def postprocess(self, preds, img, orig_img):
-        preds = ops.non_max_suppression(preds,
-                                        self.args.conf,
-                                        self.args.iou,
-                                        agnostic=self.args.agnostic_nms,
-                                        max_det=self.args.max_det)
-
-        for i, pred in enumerate(preds):
-            shape = orig_img[i].shape if self.webcam else orig_img.shape
-            pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], shape).round()
-
-        return preds
-
-    def write_results(self, idx, preds, batch):
-        p, im, im0 = batch
-        all_outputs = []
-        log_string = ""
-        if len(im.shape) == 3:
-            im = im[None]  # expand for batch dim
-        self.seen += 1
-        im0 = im0.copy()
-        if self.webcam:  # batch_size >= 1
-            log_string += f'{idx}: '
-            frame = self.dataset.count
-        else:
-            frame = getattr(self.dataset, 'frame', 0)
-
-        self.data_path = p
-        save_path = str(self.save_dir / p.name)  # im.jpg
-        self.txt_path = str(self.save_dir / 'labels' / p.stem) + ('' if self.dataset.mode == 'image' else f'_{frame}')
-        log_string += '%gx%g ' % im.shape[2:]  # print string
-        self.annotator = self.get_annotator(im0)
-
-        det = preds[idx]
-        all_outputs.append(det)
-        if len(det) == 0:
-            return log_string
-        for c in det[:, 5].unique():
-            n = (det[:, 5] == c).sum()  # detections per class
-            log_string += f"{n} {self.model.names[int(c)]}{'s' * (n > 1)}, "
-        # write
-        gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
-        xywh_bboxs = []
-        confs = []
-        oids = []
-        outputs = []
-        for *xyxy, conf, cls in reversed(det):
-            x_c, y_c, bbox_w, bbox_h = xyxy_to_xywh(*xyxy)
-            xywh_obj = [x_c, y_c, bbox_w, bbox_h]
-            xywh_bboxs.append(xywh_obj)
-            confs.append([conf.item()])
-            oids.append(int(cls))
-        xywhs = torch.Tensor(xywh_bboxs)
-        confss = torch.Tensor(confs)
-          
-        outputs = deepsort.update(xywhs, confss, oids, im0)
-        if len(outputs) > 0:
-            bbox_xyxy = outputs[:, :4]
-            identities = outputs[:, -2]
-            object_id = outputs[:, -1]
-            
-            draw_boxes(im0, bbox_xyxy, self.model.names, object_id,identities)
-
-        return log_string
+                # save image
+                output = output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                if output.ndim == 3:
+                    output = np.transpose(output[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+                output = (output * 255.0).round().astype(np.uint8)  # float32 to uint8
+                cv2.imwrite(str(out_path), output)
+        finally:
+            clean_folder(input_dir)
+        return out_path
 
 
-@hydra.main(version_base=None, config_path=str(DEFAULT_CONFIG.parent), config_name=DEFAULT_CONFIG.name)
-def predict(cfg):
-    init_tracker()
-    cfg.model = cfg.model or "yolov8n.pt"
-    cfg.imgsz = check_imgsz(cfg.imgsz, min_dim=2)  # check image size
-    cfg.source = cfg.source if cfg.source is not None else ROOT / "assets"
-    predictor = DetectionPredictor(cfg)
-    predictor()
-
-
-if __name__ == "__main__":
-    predict()
+def clean_folder(folder):
+    for filename in os.listdir(folder):
+        file_path = os.path.join(folder, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+        except Exception as e:
+            print('Failed to delete %s. Reason: %s' % (file_path, e))
